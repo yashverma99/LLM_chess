@@ -4,7 +4,7 @@ import { Chess, type Square } from 'chess.js'
 import { Chessboard, type PieceDropHandlerArgs } from 'react-chessboard'
 import './App.css'
 
-const API = 'http://127.0.0.1:8001'
+const API = '/api'
 const TOKEN_KEY = 'chess_access_token'
 
 const GAME_OVER = [
