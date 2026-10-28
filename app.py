@@ -15,7 +15,7 @@ from mangum import Mangum
 
 from engine.board import ChessBoard
 from engine.fen import to_fen
-from engine.hybrid import select_move, warmup_lstm
+from engine.hybrid import select_move
 from engine.evaluation import evaluate_position
 from engine.legal_moves import (
     generate_legal_moves,
@@ -54,12 +54,7 @@ from auth import (
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("FORMULON CHESS STARTING")
-    try:
-        warmup_lstm()
-    except Exception as error:
-        print(f"LSTM WARNING: {error}")
-    yield
-    print("FORMULON CHESS SHUTTING DOWN")
+    
 
 
 app = FastAPI(

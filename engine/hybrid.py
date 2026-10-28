@@ -2,15 +2,12 @@
 from pathlib import Path
 from functools import lru_cache
 
-from chess_lstm.inference import predict_candidate_moves
 from engine.legal_moves import (
     generate_legal_moves,
     make_move,
     undo_move,
 )
 from engine.search import (
-    INF,
-    minimax,
     find_best_move,
     order_moves,
     position_key,
@@ -20,7 +17,6 @@ from engine.search import (
     _record_killer_move,
     _record_history_move,
 )
-
 
 DEFAULT_MODEL_PATH = (
     Path(__file__).resolve().parents[1]
@@ -43,7 +39,6 @@ def _load_default_lstm():
 
     model = load_model(DEFAULT_MODEL_PATH)
     tokenizer = ChessTokenizer.load(DEFAULT_TOKENIZER_PATH)
-
     return model, tokenizer
 
 
@@ -103,14 +98,8 @@ def _ordered_legal_moves(
         if move not in candidate_moves
     ]
 
-    remaining = order_moves(
-        board,
-        remaining,
-        tt_move,
-        ply,
-    )
+    remaining = order_moves(board, remaining, tt_move, ply)
 
-    # TT and previous iteration move get highest priority.
     for priority_move in (pv_move, tt_move):
         if priority_move is None or priority_move not in legal_moves:
             continue
@@ -121,64 +110,9 @@ def _ordered_legal_moves(
         if priority_move in remaining:
             remaining.remove(priority_move)
 
-        if priority_move not in candidate_moves:
-            candidate_moves.insert(0, priority_move)
+        candidate_moves.insert(0, priority_move)
 
     return candidate_moves + remaining
-
-
-def _search_ordered_moves(
-    board,
-    moves,
-    depth,
-    stats=None,
-    tt=None,
-):
-    maximizing = board.turn == "w"
-
-    best_move = None
-    best_score = -INF if maximizing else INF
-
-    alpha = -INF
-    beta = INF
-
-    for move in moves:
-        if stats is not None:
-            stats["root_searched"] = (
-                stats.get("root_searched", 0) + 1
-            )
-
-        old_state = make_move(board, move)
-
-        try:
-            score = minimax(
-                board,
-                depth - 1,
-                alpha,
-                beta,
-                not maximizing,
-                stats,
-                tt,
-                1,
-            )
-        finally:
-            undo_move(board, move, old_state)
-
-        if maximizing:
-            if score > best_score:
-                best_move = move
-                best_score = score
-
-            alpha = max(alpha, best_score)
-
-        else:
-            if score < best_score:
-                best_move = move
-                best_score = score
-
-            beta = min(beta, best_score)
-
-    return best_move, best_score
 
 
 def select_move(
@@ -192,12 +126,7 @@ def select_move(
     top_k=5,
 ):
     """
-    LSTM-guided root move ordering with:
-    - Iterative deepening
-    - Transposition table
-    - Killer move heuristic
-    - History heuristic
-    - Alpha-beta minimax
+    LSTM-guided move ordering with automatic Minimax fallback.
     """
 
     if depth < 1:
@@ -222,7 +151,6 @@ def select_move(
         return None, None, stats
 
     candidates = []
-    lstm_error = None
 
     try:
         lstm_model, lstm_tokenizer = _load_lstm(
@@ -232,14 +160,14 @@ def select_move(
             tokenizer_path,
         )
 
-        sequence_length = lstm_model.input_shape[1]
+        from chess_lstm.inference import predict_candidate_moves
 
         candidates = predict_candidate_moves(
             board,
             history or [],
             lstm_model,
             lstm_tokenizer,
-            sequence_length,
+            lstm_model.input_shape[1],
             top_k=top_k,
         )
 
@@ -247,89 +175,121 @@ def select_move(
             "lstm-guided" if candidates else "engine-fallback"
         )
 
-    except (
-        ImportError,
-        OSError,
-        RuntimeError,
-        TypeError,
-        ValueError,
-    ) as error:
-        lstm_error = str(error)
-
-    if lstm_error:
-        stats["lstm_error"] = lstm_error
-
-        best_move, score = find_best_move(
-            board,
-            depth,
-            stats,
-        )
-
+    except Exception as error:
+        stats["lstm_error"] = str(error)
+        best_move, score = find_best_move(board, depth, stats)
         stats["searched_moves"] = len(legal_moves)
         stats["mode"] = "engine-fallback"
-
         return best_move, score, stats
 
-    stats["lstm_candidates"] = len({
-        tuple(candidate[1])
-        for candidate in candidates
-        if isinstance(candidate, (tuple, list))
-        and len(candidate) >= 2
-    })
-
-    tt = {}
+    stats["lstm_candidates"] = len(candidates)
 
     best_move = None
-    best_score = -INF if board.turn == "w" else INF
+    best_score = float("-inf")
+    pv_move = None
 
     for current_depth in range(1, depth + 1):
-        root_key = position_key(board)
+        alpha = float("-inf")
+        beta = float("inf")
 
-        root_entry = tt.get(root_key)
-        tt_move = (
-            root_entry.get("best_move")
-            if root_entry else None
-        )
+        key = position_key(board)
+        tt_move = None
 
         ordered_moves = _ordered_legal_moves(
             board,
             legal_moves,
             candidates,
             tt_move,
-            best_move,
+            pv_move,
             0,
         )
 
-        stats["searched_moves"] = len(ordered_moves)
+        iteration_best_move = None
+        iteration_best_score = float("-inf")
 
-        iteration_move, iteration_score = _search_ordered_moves(
-            board,
-            ordered_moves,
-            current_depth,
-            stats,
-            tt,
-        )
+        for move in ordered_moves:
+            undo_data = make_move(board, move)
 
-        if iteration_move is not None:
-            best_move = iteration_move
-            best_score = iteration_score
+            try:
+                score = -_hybrid_minimax(
+                    board,
+                    current_depth - 1,
+                    -beta,
+                    -alpha,
+                    1,
+                    stats,
+                )
+            finally:
+                undo_move(board, move, undo_data)
 
-        stats["completed_depth"] = current_depth
+            stats["root_searched"] += 1
 
-        _store_tt(
-            tt,
-            root_key,
-            {
-                "depth": current_depth,
-                "score": _score_to_tt(best_score, 0),
-                "flag": 0,
-                "best_move": best_move,
-            },
-        )
+            if score > iteration_best_score:
+                iteration_best_score = score
+                iteration_best_move = move
 
-    stats["tt_entries"] = len(tt)
+            alpha = max(alpha, score)
+
+        if iteration_best_move is not None:
+            best_move = iteration_best_move
+            best_score = iteration_best_score
+            pv_move = best_move
+            stats["completed_depth"] = current_depth
+
+    stats["searched_moves"] = stats["root_searched"]
 
     return best_move, best_score, stats
 
 
-find_hybrid_move = select_move
+def _hybrid_minimax(
+    board,
+    depth,
+    alpha,
+    beta,
+    ply,
+    stats,
+):
+    stats["nodes"] += 1
+
+    if depth <= 0:
+        return find_best_move(board, 1, stats)[1]
+
+    legal_moves = generate_legal_moves(board)
+
+    if not legal_moves:
+        return 0
+
+    moves = order_moves(board, legal_moves, None, ply)
+
+    best_score = float("-inf")
+
+    for move in moves:
+        undo_data = make_move(board, move)
+
+        try:
+            score = -_hybrid_minimax(
+                board,
+                depth - 1,
+                -beta,
+                -alpha,
+                ply + 1,
+                stats,
+            )
+        finally:
+            undo_move(board, move, undo_data)
+
+        if score > best_score:
+            best_score = score
+
+        alpha = max(alpha, score)
+
+        if alpha >= beta:
+            stats["cutoffs"] += 1
+
+            if not _is_capture(board, move):
+                _record_killer_move(move, ply)
+                _record_history_move(board,move, depth)
+
+            break
+
+    return best_score
