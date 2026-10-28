@@ -1,0 +1,23 @@
+{
+  "checkpoint_path": "artifacts/fics_best.keras",
+  "epochs_completed": 6,
+  "epochs_requested": 20,
+  "final_loss": 4.299,
+  "final_validation_accuracy": 0.1531,
+  "final_validation_loss": 4.44,
+  "model_path": "chess_lstm/chess_model_fics.keras",
+  "seed": 42,
+  "source": "dataset\\raw\\fics_10000.pgn",
+  "test_examples": 72582,
+  "test_games": 993,
+  "tokenizer_path": "dataset/processed/fics_tokenizer.json",
+  "total_games": 9938,
+  "train_examples": 598248,
+  "train_games": 7952,
+  "training_note": "Run stopped after epoch 6 due to CPU runtime; metrics are from the completed run output.",
+  "training_stopped_after_epoch": 6,
+  "validation_examples": 72034,
+  "validation_games": 993,
+  "vocabulary_size": 3593,
+  "window_size": 128
+}

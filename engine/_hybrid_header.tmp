@@ -1,0 +1,43 @@
+﻿from pathlib import Path
+from functools import lru_cache
+
+from chess_lstm.inference import predict_candidate_moves
+from engine.legal_moves import generate_legal_moves, make_move, undo_move
+from engine.search import INF, minimax, find_best_move
+
+
+DEFAULT_MODEL_PATH = (
+    Path(__file__).resolve().parents[1] / "chess_lstm" / "chess_model.keras"
+)
+DEFAULT_TOKENIZER_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "dataset"
+    / "processed"
+    / "chess_tokenizer.json"
+)
+
+
+@lru_cache(maxsize=1)
+def _load_default_lstm():
+    from chess_lstm.model import load_model
+    from chess_lstm.tokenizer import ChessTokenizer
+
+    model = load_model(DEFAULT_MODEL_PATH)
+    tokenizer = ChessTokenizer.load(DEFAULT_TOKENIZER_PATH)
+    return model, tokenizer
+
+
+def _load_lstm(model=None, tokenizer=None, model_path=None, tokenizer_path=None):
+    if model is not None and tokenizer is not None:
+        return model, tokenizer
+
+    if model_path is None and tokenizer_path is None:
+        return _load_default_lstm()
+
+    from chess_lstm.model import load_model
+    from chess_lstm.tokenizer import ChessTokenizer
+
+    return (
+        load_model(model_path or DEFAULT_MODEL_PATH),
+        ChessTokenizer.load(tokenizer_path or DEFAULT_TOKENIZER_PATH),
+    )

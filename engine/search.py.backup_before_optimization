@@ -1,0 +1,190 @@
+
+from engine.legal_moves import (
+    generate_legal_moves,
+    make_move,
+    undo_move,
+    is_in_check
+)
+
+from engine.evaluation import evaluate_position
+
+
+INF = 10**9
+MATE_SCORE = 100000
+
+
+def order_moves(board, moves):
+
+    def move_priority(move):
+
+        from_sq, to_sq = move
+
+        attacker = board.board[from_sq]
+        victim = board.board[to_sq]
+
+        score = 0
+
+        # Captures first: MVV-LVA
+        if victim != ".":
+            values = {
+                "p": 100,
+                "n": 320,
+                "b": 330,
+                "r": 500,
+                "q": 900,
+                "k": 20000
+            }
+
+            score += (
+                10 * values[victim.lower()]
+                - values[attacker.lower()]
+            )
+
+        # Promotion bonus
+        if attacker.lower() == "p" and to_sq // 8 in (0, 7):
+            score += 800
+
+        return score
+
+    return sorted(moves, key=move_priority, reverse=True)
+
+
+def minimax(board, depth, alpha, beta, maximizing, stats=None):
+
+    if stats is not None:
+        stats["nodes"] = stats.get("nodes", 0) + 1
+
+    # Generate legal moves
+    moves = generate_legal_moves(board)
+
+    # Terminal positions
+    if not moves:
+
+        if is_in_check(board, board.turn):
+            return -MATE_SCORE if maximizing else MATE_SCORE
+
+        return 0
+
+    # Leaf evaluation
+    if depth == 0:
+        return evaluate_position(board)
+
+    moves = order_moves(board, moves)
+
+    if maximizing:
+
+        best_score = -INF
+
+        for move in moves:
+
+            old_state = make_move(board, move)
+
+            try:
+                score = minimax(
+                    board,
+                    depth - 1,
+                    alpha,
+                    beta,
+                    False,
+                    stats,
+                )
+            finally:
+                undo_move(board, move, old_state)
+
+            best_score = max(best_score, score)
+            alpha = max(alpha, best_score)
+
+            if beta <= alpha:
+                if stats is not None:
+                    stats["cutoffs"] = stats.get("cutoffs", 0) + 1
+                break
+
+        return best_score
+
+    else:
+
+        best_score = INF
+
+        for move in moves:
+
+            old_state = make_move(board, move)
+
+            try:
+                score = minimax(
+                    board,
+                    depth - 1,
+                    alpha,
+                    beta,
+                    True,
+                    stats,
+                )
+            finally:
+                undo_move(board, move, old_state)
+
+            best_score = min(best_score, score)
+            beta = min(beta, best_score)
+
+            if beta <= alpha:
+                if stats is not None:
+                    stats["cutoffs"] = stats.get("cutoffs", 0) + 1
+                break
+
+        return best_score
+
+
+def find_best_move(board, depth=3, stats=None):
+
+    if depth < 1:
+        raise ValueError("Depth must be at least 1")
+
+    maximizing = board.turn == "w"
+
+    moves = generate_legal_moves(board)
+
+    if not moves:
+        return None, None
+    if stats is not None:
+        stats["root_moves"] = len(moves)
+
+    moves = order_moves(board, moves)
+
+    best_move = None
+
+    best_score = -INF if maximizing else INF
+
+    alpha = -INF
+    beta = INF
+
+    for move in moves:
+
+        old_state = make_move(board, move)
+
+        try:
+            score = minimax(
+                board,
+                depth - 1,
+                alpha,
+                beta,
+                not maximizing,
+                stats,
+            )
+        finally:
+            undo_move(board, move, old_state)
+
+        if maximizing:
+
+            if score > best_score:
+                best_score = score
+                best_move = move
+
+            alpha = max(alpha, best_score)
+
+        else:
+
+            if score < best_score:
+                best_score = score
+                best_move = move
+
+            beta = min(beta, best_score)
+
+    return best_move, best_score

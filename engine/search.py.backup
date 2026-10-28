@@ -1,0 +1,363 @@
+
+from engine.legal_moves import (
+    generate_legal_moves,
+    make_move,
+    undo_move,
+    is_in_check,
+)
+
+from engine.evaluation import evaluate_position
+
+
+INF = 10**9
+MATE_SCORE = 100000
+MATE_THRESHOLD = MATE_SCORE - 1000
+MAX_TT_ENTRIES = 200000
+
+# Transposition table:
+# key -> {"depth": int, "score": int, "flag": int, "best_move": tuple}
+EXACT = 0
+LOWER_BOUND = 1
+UPPER_BOUND = 2
+
+
+def position_key(board):
+    """Create a hashable key for the current chess position."""
+    return (
+        tuple(board.board),
+        board.turn,
+        board.castling,
+        board.en_passant,
+        board.halfmove_clock,
+    )
+
+
+def _score_to_tt(score, ply):
+    """Normalize mate scores before storing them in the TT."""
+    if score >= MATE_THRESHOLD:
+        return score + ply
+    if score <= -MATE_THRESHOLD:
+        return score - ply
+    return score
+
+
+def _score_from_tt(score, ply):
+    """Restore mate scores when reading them from the TT."""
+    if score >= MATE_THRESHOLD:
+        return score - ply
+    if score <= -MATE_THRESHOLD:
+        return score + ply
+    return score
+
+
+def _store_tt(tt, key, entry):
+    """Store an entry, preferring deeper searches."""
+    if tt is None:
+        return
+
+    old_entry = tt.get(key)
+
+    if old_entry is not None and old_entry["depth"] > entry["depth"]:
+        return
+
+    if len(tt) >= MAX_TT_ENTRIES and key not in tt:
+        # Simple bounded replacement strategy.
+        tt.clear()
+
+    tt[key] = entry
+
+
+def order_moves(board, moves, tt_move=None):
+    """Prioritize TT move, captures and promotions."""
+
+    values = {
+        "p": 100,
+        "n": 320,
+        "b": 330,
+        "r": 500,
+        "q": 900,
+        "k": 20000,
+    }
+
+    def move_priority(move):
+        from_sq, to_sq = move
+        attacker = board.board[from_sq]
+        victim = board.board[to_sq]
+
+        score = 0
+
+        if move == tt_move:
+            score += 10**7
+
+        # MVV-LVA capture ordering.
+        if victim != ".":
+            score += (
+                10 * values[victim.lower()]
+                - values[attacker.lower()]
+            )
+
+        # Promotion bonus.
+        if attacker.lower() == "p" and to_sq // 8 in (0, 7):
+            score += 800
+
+        return score
+
+    return sorted(moves, key=move_priority, reverse=True)
+
+
+def minimax(
+    board,
+    depth,
+    alpha,
+    beta,
+    maximizing,
+    stats=None,
+    tt=None,
+    ply=0,
+):
+    """Alpha-beta minimax with transposition-table support."""
+
+    if stats is not None:
+        stats["nodes"] = stats.get("nodes", 0) + 1
+
+    original_alpha = alpha
+    original_beta = beta
+
+    key = position_key(board)
+    tt_entry = tt.get(key) if tt is not None else None
+    tt_move = None
+
+    if tt_entry is not None:
+        tt_move = tt_entry.get("best_move")
+
+        if stats is not None:
+            stats["tt_hits"] = stats.get("tt_hits", 0) + 1
+
+        if tt_entry["depth"] >= depth:
+            tt_score = _score_from_tt(tt_entry["score"], ply)
+            flag = tt_entry["flag"]
+
+            if flag == EXACT:
+                return tt_score
+            elif flag == LOWER_BOUND:
+                alpha = max(alpha, tt_score)
+            elif flag == UPPER_BOUND:
+                beta = min(beta, tt_score)
+
+            if alpha >= beta:
+                return tt_score
+
+    moves = generate_legal_moves(board)
+
+    # Checkmate and stalemate must be detected before leaf evaluation.
+    if not moves:
+        if is_in_check(board, board.turn):
+            score = (
+                -MATE_SCORE + ply
+                if board.turn == "w"
+                else MATE_SCORE - ply
+            )
+        else:
+            score = 0
+
+        if tt is not None:
+            _store_tt(
+                tt,
+                key,
+                {
+                    "depth": depth,
+                    "score": _score_to_tt(score, ply),
+                    "flag": EXACT,
+                    "best_move": None,
+                },
+            )
+
+        return score
+
+    if depth <= 0:
+        return evaluate_position(board)
+
+    moves = order_moves(board, moves, tt_move)
+
+    best_move = None
+
+    if maximizing:
+        best_score = -INF
+
+        for move in moves:
+            old_state = make_move(board, move)
+
+            try:
+                score = minimax(
+                    board,
+                    depth - 1,
+                    alpha,
+                    beta,
+                    False,
+                    stats,
+                    tt,
+                    ply + 1,
+                )
+            finally:
+                undo_move(board, move, old_state)
+
+            if score > best_score:
+                best_score = score
+                best_move = move
+
+            alpha = max(alpha, best_score)
+
+            if alpha >= beta:
+                if stats is not None:
+                    stats["cutoffs"] = stats.get("cutoffs", 0) + 1
+                break
+
+    else:
+        best_score = INF
+
+        for move in moves:
+            old_state = make_move(board, move)
+
+            try:
+                score = minimax(
+                    board,
+                    depth - 1,
+                    alpha,
+                    beta,
+                    True,
+                    stats,
+                    tt,
+                    ply + 1,
+                )
+            finally:
+                undo_move(board, move, old_state)
+
+            if score < best_score:
+                best_score = score
+                best_move = move
+
+            beta = min(beta, best_score)
+
+            if alpha >= beta:
+                if stats is not None:
+                    stats["cutoffs"] = stats.get("cutoffs", 0) + 1
+                break
+
+    if tt is not None:
+        if best_score <= original_alpha:
+            flag = UPPER_BOUND
+        elif best_score >= original_beta:
+            flag = LOWER_BOUND
+        else:
+            flag = EXACT
+
+        _store_tt(
+            tt,
+            key,
+            {
+                "depth": depth,
+                "score": _score_to_tt(best_score, ply),
+                "flag": flag,
+                "best_move": best_move,
+            },
+        )
+
+    return best_score
+
+
+def _search_root(board, moves, depth, stats, tt):
+    maximizing = board.turn == "w"
+
+    best_move = None
+    best_score = -INF if maximizing else INF
+    alpha = -INF
+    beta = INF
+
+    root_key = position_key(board)
+    root_entry = tt.get(root_key)
+    tt_move = root_entry.get("best_move") if root_entry else None
+
+    moves = order_moves(board, moves, tt_move)
+
+    for move in moves:
+        old_state = make_move(board, move)
+
+        try:
+            score = minimax(
+                board,
+                depth - 1,
+                alpha,
+                beta,
+                not maximizing,
+                stats,
+                tt,
+                1,
+            )
+        finally:
+            undo_move(board, move, old_state)
+
+        if maximizing:
+            if score > best_score:
+                best_score = score
+                best_move = move
+            alpha = max(alpha, best_score)
+        else:
+            if score < best_score:
+                best_score = score
+                best_move = move
+            beta = min(beta, best_score)
+
+    _store_tt(
+        tt,
+        root_key,
+        {
+            "depth": depth,
+            "score": _score_to_tt(best_score, 0),
+            "flag": EXACT,
+            "best_move": best_move,
+        },
+    )
+
+    return best_move, best_score
+
+
+def find_best_move(board, depth=3, stats=None):
+    """Iterative deepening root search with a shared TT."""
+
+    if depth < 1:
+        raise ValueError("Depth must be at least 1")
+
+    moves = generate_legal_moves(board)
+
+    if not moves:
+        return None, None
+
+    if stats is not None:
+        stats["root_moves"] = len(moves)
+        stats.setdefault("completed_depth", 0)
+        stats.setdefault("tt_hits", 0)
+
+    tt = {}
+    best_move = None
+    best_score = 0
+
+    for current_depth in range(1, depth + 1):
+        iteration_move, iteration_score = _search_root(
+            board,
+            moves,
+            current_depth,
+            stats,
+            tt,
+        )
+
+        if iteration_move is not None:
+            best_move = iteration_move
+            best_score = iteration_score
+
+        if stats is not None:
+            stats["completed_depth"] = current_depth
+
+    if stats is not None:
+        stats["tt_entries"] = len(tt)
+
+    return best_move, best_score

@@ -1,0 +1,1 @@
+"""GUI module for Chess AI Hybrid project."""
