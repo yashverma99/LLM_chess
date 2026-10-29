@@ -42,6 +42,7 @@ class Game(Base):
     opponent_type = Column(String(20), nullable=False)
     difficulty = Column(String(30), nullable=True)
     player_color = Column(String(10), nullable=True)
+    time_control = Column(String(20), default="10+0", nullable=False)
 
     result = Column(String(10), nullable=True)
     status = Column(String(20), default="in_progress")
