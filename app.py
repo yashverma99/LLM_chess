@@ -76,7 +76,7 @@ app.add_middleware(
         "http://127.0.0.1:5173",
         "http://localhost:5176",
         "http://127.0.0.1:5176",
-        "https://llm-chess-tau.vercel.app",
+        "https://llm-chess-ttfm.vercel.app",
     ],
     allow_credentials=True,
     allow_methods=["*"],

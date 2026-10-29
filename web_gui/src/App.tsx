@@ -4,7 +4,7 @@ import { Chess, type Square } from 'chess.js'
 import { Chessboard, type PieceDropHandlerArgs } from 'react-chessboard'
 import './App.css'
 
-const API = 'https://llm-chess-4.onrender.com/api'
+const API = 'https://llm-chess-4.onrender.com'
 const TOKEN_KEY = 'chess_access_token'
 
 const GAME_OVER = [
