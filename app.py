@@ -54,6 +54,11 @@ from auth import (
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("FORMULON CHESS STARTING")
+
+    try:
+        yield
+    finally:
+        print("FORMULON CHESS SHUTTING DOWN")
     
 
 
