@@ -1,5 +1,5 @@
 
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Chess, type Square } from 'chess.js'
 import { Chessboard, type PieceDropHandlerArgs } from 'react-chessboard'
 import './App.css'
@@ -16,6 +16,7 @@ const GAME_OVER = [
   'threefold_repetition',
   'fifty_move_rule',
   'insufficient_material',
+  'timeout',
 ]
 
 type Quality =
@@ -77,6 +78,11 @@ interface ApiResponse {
   last_move_uci?: string
   winner?: string | null
   ai_score?: number
+  player_color?: string
+  white_time_ms?: number
+  black_time_ms?: number
+  timed_out?: boolean
+  timeout_winner?: string | null
   ai_stats?: {
     depth?: number
     nodes?: number
@@ -177,7 +183,7 @@ function normalizeQuality(value: string): Quality {
 }
 
 function formatTime(ms: number): string {
-  const totalSeconds = Math.ceil(ms / 1000)
+  const totalSeconds = Math.ceil(Math.max(0, ms) / 1000)
   const minutes = Math.floor(totalSeconds / 60)
   const seconds = totalSeconds % 60
   return `${minutes}:${seconds.toString().padStart(2, '0')}`
@@ -274,13 +280,11 @@ function App() {
   const [gameStatus, setGameStatus] = useState('playing')
   const [orientation, setOrientation] = useState<'white' | 'black'>('white')
   const [difficulty, setDifficulty] = useState('hard')
-  // New states for time control and color selection
   const [timeControl, setTimeControl] = useState('10+0')
   const [colorSelection, setColorSelection] = useState<'white' | 'black' | 'random'>('white')
-  // Timer states
+
   const [whiteTimeMs, setWhiteTimeMs] = useState(600000)
   const [blackTimeMs, setBlackTimeMs] = useState(600000)
-  const [lastUpdateTime, setLastUpdateTime] = useState<number>(Date.now())
   const [gameStarted, setGameStarted] = useState(false)
 
   const [thinking, setThinking] = useState(false)
@@ -301,19 +305,55 @@ function App() {
   const [reviewLoading, setReviewLoading] = useState(false)
   const [showReview, setShowReview] = useState(false)
 
+  // Refs avoid timer resets and stale values.
+  const lastClockUpdate = useRef(Date.now())
+  const currentTurnRef = useRef<'w' | 'b'>('w')
+  const whiteTimeRef = useRef(whiteTimeMs)
+  const blackTimeRef = useRef(blackTimeMs)
+  const gameStartedRef = useRef(false)
+  const syncInProgress = useRef(false)
+  const moveInProgress = useRef(false)
+
   const isGameOver = GAME_OVER.includes(gameStatus)
 
-  function updateGame(data: any) {
+  useEffect(() => {
+    currentTurnRef.current = game.turn()
+  }, [game])
+
+  useEffect(() => {
+    whiteTimeRef.current = whiteTimeMs
+  }, [whiteTimeMs])
+
+  useEffect(() => {
+    blackTimeRef.current = blackTimeMs
+  }, [blackTimeMs])
+
+  useEffect(() => {
+    gameStartedRef.current = gameStarted
+  }, [gameStarted])
+
+  function setServerClock(data: ApiResponse) {
+    if (data.white_time_ms !== undefined) {
+      whiteTimeRef.current = data.white_time_ms
+      setWhiteTimeMs(data.white_time_ms)
+    }
+
+    if (data.black_time_ms !== undefined) {
+      blackTimeRef.current = data.black_time_ms
+      setBlackTimeMs(data.black_time_ms)
+    }
+
+    lastClockUpdate.current = Date.now()
+  }
+
+  function updateGame(data: ApiResponse) {
     setGame(gameFromResponse(data))
     setHistory(data.history || [])
     setGameStatus(data.status)
+    currentTurnRef.current = data.turn
 
-    // Update clock times from server
-    if (data.white_time_ms !== undefined) setWhiteTimeMs(data.white_time_ms)
-    if (data.black_time_ms !== undefined) setBlackTimeMs(data.black_time_ms)
-    setLastUpdateTime(Date.now())
+    setServerClock(data)
 
-    // Set board orientation based on player color
     if (data.player_color) {
       setOrientation(data.player_color as 'white' | 'black')
     }
@@ -321,7 +361,6 @@ function App() {
     if (data.ai_score !== undefined) setAiScore(data.ai_score)
     if (data.ai_stats) setAiStats(data.ai_stats)
 
-    // Handle timeout
     if (data.timed_out && data.timeout_winner) {
       if (data.timeout_winner === 'draw') {
         setStatus('DRAW - TIMEOUT (INSUFFICIENT MATERIAL)')
@@ -347,10 +386,7 @@ function App() {
     } else if (data.status === 'check') {
       setStatus('CHECK!')
     } else {
-      // Start the game clock once first move is made
-      if (data.moves_played > 0 && !gameStarted) {
-        setGameStarted(true)
-      }
+      if (data.moves_played > 0) setGameStarted(true)
       setStatus(data.turn === 'w' ? 'Your move' : 'AI to move')
     }
 
@@ -419,6 +455,7 @@ function App() {
     setGame(new Chess())
     setAnnotations([])
     setReview(null)
+    setGameStarted(false)
   }
 
   async function newGame() {
@@ -435,16 +472,17 @@ function App() {
     setReviewGameId(null)
     setSelectedPly(-1)
     setShowReview(false)
+    setShowHistory(false)
     setGameStarted(false)
 
-    // Handle random color selection
-    let selectedColor = colorSelection
+    let selectedColor: string = colorSelection
+
     if (colorSelection === 'random') {
       selectedColor = Math.random() < 0.5 ? 'white' : 'black'
     }
 
     try {
-      const data = await request<any>('/api/new-game', token, {
+      const data = await request<ApiResponse>('/api/new-game', token, {
         method: 'POST',
         body: JSON.stringify({
           opponent_type: 'ai',
@@ -456,19 +494,16 @@ function App() {
 
       updateGame(data)
 
-      // If player is black, AI makes the first move
       if (data.player_color === 'black' && !GAME_OVER.includes(data.status)) {
         setStatus('AI is thinking...')
-        const aiResponse = await request<any>('/api/ai-move', token, { method: 'POST' })
+
+        const aiResponse = await request<ApiResponse>(
+          '/api/ai-move',
+          token,
+          { method: 'POST' }
+        )
+
         updateGame(aiResponse)
-        
-        if (GAME_OVER.includes(aiResponse.status)) {
-          await loadProfile(token)
-          await loadHistory(token)
-          if (aiResponse.game_id) {
-            await loadReview(aiResponse.game_id)
-          }
-        }
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not start game')
@@ -539,8 +574,9 @@ function App() {
   }
 
   async function processMove(from: Square, to: Square) {
-    if (!token || thinking) return
+    if (!token || moveInProgress.current || isGameOver) return
 
+    moveInProgress.current = true
     setThinking(true)
     setError('')
 
@@ -576,20 +612,23 @@ function App() {
         if (GAME_OVER.includes(aiResponse.status)) {
           await loadProfile(token)
           await loadHistory(token)
+
           if (aiResponse.game_id) {
-            await loadReview(aiResponse.game_id)
+            void loadReview(aiResponse.game_id)
           }
         }
       } else if (GAME_OVER.includes(playerResponse.status)) {
         await loadProfile(token)
         await loadHistory(token)
+
         if (playerResponse.game_id) {
-          await loadReview(playerResponse.game_id)
+          void loadReview(playerResponse.game_id)
         }
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Move failed')
     } finally {
+      moveInProgress.current = false
       setThinking(false)
     }
   }
@@ -598,15 +637,18 @@ function App() {
     sourceSquare,
     targetSquare,
   }: PieceDropHandlerArgs): boolean {
-    // Only allow moves if it's the player's turn
     const playerTurn = orientation === 'white' ? 'w' : 'b'
+
     if (
       !targetSquare ||
       !token ||
+      moveInProgress.current ||
       thinking ||
       isGameOver ||
       game.turn() !== playerTurn
-    ) return false
+    ) {
+      return false
+    }
 
     const from = sourceSquare as Square
     const to = targetSquare as Square
@@ -623,7 +665,7 @@ function App() {
   }
 
   async function undoMove() {
-    if (!token || thinking || history.length === 0) return
+    if (!token || thinking || history.length === 0 || moveInProgress.current) return
 
     setThinking(true)
     setError('')
@@ -644,49 +686,68 @@ function App() {
     }
   }
 
-  // Timer effect to update clocks
+  // Smooth timer. Uses refs so it does not restart on every render.
   useEffect(() => {
     if (!gameStarted || isGameOver) return
 
-    const interval = setInterval(() => {
+    lastClockUpdate.current = Date.now()
+
+    const interval = window.setInterval(() => {
       const now = Date.now()
-      const elapsed = now - lastUpdateTime
-      
-      if (elapsed > 0) {
-        const currentTurn = game.turn()
-        if (currentTurn === 'w') {
-          setWhiteTimeMs(prev => Math.max(0, prev - elapsed))
-        } else {
-          setBlackTimeMs(prev => Math.max(0, prev - elapsed))
-        }
-        setLastUpdateTime(now)
+      const elapsed = now - lastClockUpdate.current
+
+      if (elapsed <= 0) return
+
+      lastClockUpdate.current = now
+
+      if (currentTurnRef.current === 'w') {
+        whiteTimeRef.current = Math.max(0, whiteTimeRef.current - elapsed)
+        setWhiteTimeMs(whiteTimeRef.current)
+      } else {
+        blackTimeRef.current = Math.max(0, blackTimeRef.current - elapsed)
+        setBlackTimeMs(blackTimeRef.current)
       }
     }, 100)
 
-    return () => clearInterval(interval)
-  }, [gameStarted, isGameOver, game.turn(), lastUpdateTime])
+    return () => window.clearInterval(interval)
+  }, [gameStarted, isGameOver])
 
-  // Backend clock sync to ensure accuracy - don't rely only on frontend
+  // Periodic backend clock sync. Never overlap requests.
   useEffect(() => {
     if (!token || !gameStarted || isGameOver) return
 
-    const syncInterval = setInterval(async () => {
+    let cancelled = false
+
+    const syncClock = async () => {
+      if (syncInProgress.current || cancelled) return
+
+      syncInProgress.current = true
+
       try {
-        const data = await request<any>('/api/status', token)
-        if (data.white_time_ms !== undefined) setWhiteTimeMs(data.white_time_ms)
-        if (data.black_time_ms !== undefined) setBlackTimeMs(data.black_time_ms)
-        setLastUpdateTime(Date.now())
-        
-        // Check for timeout from backend
+        const data = await request<ApiResponse>('/api/status', token)
+
+        if (cancelled) return
+
+        setServerClock(data)
+
         if (data.timed_out && data.timeout_winner) {
           updateGame(data)
         }
       } catch (err) {
         console.error('Clock sync failed:', err)
+      } finally {
+        syncInProgress.current = false
       }
-    }, 2000) // Sync every 2 seconds to maintain accuracy
+    }
 
-    return () => clearInterval(syncInterval)
+    const interval = window.setInterval(() => {
+      void syncClock()
+    }, 5000)
+
+    return () => {
+      cancelled = true
+      window.clearInterval(interval)
+    }
   }, [token, gameStarted, isGameOver])
 
   useEffect(() => {
@@ -720,14 +781,18 @@ function App() {
     }
   }, [token])
 
-  // Poll while the backend is still generating the review.
+  // Review polling
   useEffect(() => {
     if (!token || !isGameOver || !reviewGameId) return
     if (reviewStatus === 'completed' || reviewStatus === 'failed') return
 
     let cancelled = false
+    let polling = false
 
-    const timer = window.setInterval(async () => {
+    const pollReview = async () => {
+      if (polling || cancelled) return
+      polling = true
+
       try {
         const response = await request<ReviewApiResponse>(
           `/api/games/${reviewGameId}/review`,
@@ -755,7 +820,13 @@ function App() {
         if (!cancelled) {
           setReviewError(err instanceof Error ? err.message : 'Review polling failed')
         }
+      } finally {
+        polling = false
       }
+    }
+
+    const timer = window.setInterval(() => {
+      void pollReview()
     }, 2500)
 
     return () => {
@@ -798,7 +869,6 @@ function App() {
       try {
         chess.move(move.san)
       } catch {
-        // Stop using invalid/incomplete SAN entries.
         break
       }
     }
@@ -927,7 +997,6 @@ function App() {
 
       <main className="main-layout">
         <section className="game-area">
-          {/* Top player card - always shows the player that's physically on top of the board */}
           <div className={`player-card ${(game.turn() === 'b' && gameStarted) ? 'active-clock' : ''}`}>
             <div className="avatar">{orientation === 'white' ? '♟' : '♙'}</div>
             <div>
@@ -950,8 +1019,9 @@ function App() {
                     !showReview &&
                     !isGameOver &&
                     !thinking &&
+                    !moveInProgress.current &&
                     game.turn() === (orientation === 'white' ? 'w' : 'b'),
-                  animationDurationInMs: 180,
+                  animationDurationInMs: 120,
                   squareStyles: Object.fromEntries(
                     annotations
                       .filter(() => !showReview)
@@ -996,7 +1066,6 @@ function App() {
             </div>
           </div>
 
-          {/* Bottom player card - always shows the player that's physically at the bottom of the board */}
           <div className={`player-card bottom-player ${(game.turn() === 'w' && gameStarted) ? 'active-clock' : ''}`}>
             <div className="avatar user-avatar">{orientation === 'white' ? '♙' : '♟'}</div>
             <div>
@@ -1096,9 +1165,7 @@ function App() {
                     <line x1="0" y1="90" x2="600" y2="90" />
                     <polyline
                       points={graphValues.map((point, index) => {
-                        const x = graphValues.length <= 1
-                          ? 0
-                          : index * 600 / (graphValues.length - 1)
+                        const x = index * 600 / (graphValues.length - 1)
                         const y = 90 - Math.max(-80, Math.min(80, point.value)) * 0.9
                         return `${x},${y}`
                       }).join(' ')}

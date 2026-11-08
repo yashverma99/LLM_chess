@@ -1,11 +1,12 @@
 
 import time
+import json
+import jwt
+
 from datetime import datetime
 from contextlib import asynccontextmanager
 
-import jwt
-
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
@@ -24,9 +25,17 @@ from engine.legal_moves import (
     is_in_check,
 )
 from engine.san import move_to_san
+from engine.review import generate_game_review
 
 from database.connection import get_db
-from database.models import User, RevokedToken, Game, RatingHistory
+from database.models import (
+    User,
+    RevokedToken,
+    Game,
+    RatingHistory,
+    MoveRecord,
+    GameReview,
+)
 
 from game_sessions import (
     create_session,
@@ -54,12 +63,10 @@ from auth import (
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("FORMULON CHESS STARTING")
-
     try:
         yield
     finally:
         print("FORMULON CHESS SHUTTING DOWN")
-    
 
 
 app = FastAPI(
@@ -162,7 +169,7 @@ class NewGameRequest(BaseModel):
     opponent_type: str = "ai"
     difficulty: str = "hard"
     player_color: str = "white"
-    time_control: str = "10+0"  # format: minutes+increment, supported: 1+0, 3+0, 5+0, 10+0, 15+0
+    time_control: str = "10+0"
 
 
 class SignupRequest(BaseModel):
@@ -298,6 +305,97 @@ def get_status(session):
     return "playing"
 
 
+# =====================================================
+# MOVE RECORDING
+# =====================================================
+
+def save_move_record(db, game, board, move, san, ply):
+    from_index, to_index = move
+
+    fen_before = to_fen(board)
+    color = board.turn
+
+    uci = (
+        board.index_to_square(from_index)
+        + board.index_to_square(to_index)
+    )
+
+    old_state = make_move(board, move)
+    fen_after = to_fen(board)
+    undo_move(board, move, old_state)
+
+    record = MoveRecord(
+        game_id=game.id,
+        ply=ply,
+        move_number=(ply + 1) // 2,
+        color=color,
+        san=san,
+        uci=uci,
+        fen_before=fen_before,
+        fen_after=fen_after,
+    )
+
+    db.add(record)
+    db.commit()
+
+
+# =====================================================
+# GAME REVIEW HELPERS
+# =====================================================
+
+def schedule_game_review(background_tasks, db, game_id):
+    """
+    Schedule review only when it is not already completed
+    or currently being analyzed.
+    """
+
+    review = db.query(GameReview).filter(
+        GameReview.game_id == game_id
+    ).first()
+
+    if review is None:
+        review = GameReview(
+            game_id=game_id,
+            status="pending",
+        )
+        db.add(review)
+        db.commit()
+        db.refresh(review)
+
+    if review.status in ("completed", "analyzing"):
+        return
+
+    background_tasks.add_task(
+        generate_game_review,
+        game_id,
+    )
+
+
+def get_review_response(review):
+    parsed_review = None
+
+    if review.review_json:
+        try:
+            parsed_review = json.loads(review.review_json)
+        except (json.JSONDecodeError, TypeError):
+            parsed_review = None
+
+    return {
+        "game_id": review.game_id,
+        "status": review.status,
+        "review": parsed_review,
+        "review_json": review.review_json,
+        "white_accuracy": review.white_accuracy,
+        "black_accuracy": review.black_accuracy,
+        "opening_name": review.opening_name,
+        "error": review.error,
+    }
+
+
+# =====================================================
+# GAME DATABASE HELPERS
+# =====================================================
+
 def sync_session_to_game(session, game, db):
     game.white_time_ms = session.white_time_ms
     game.black_time_ms = session.black_time_ms
@@ -418,7 +516,6 @@ def get_captured_piece(board, move):
     if target_piece != ".":
         return target_piece
 
-    # En passant
     if (
         moving_piece.lower() == "p"
         and from_index % 8 != to_index % 8
@@ -504,13 +601,17 @@ def root():
 
 @app.get("/api/status")
 def api_status(
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     session = get_user_game(current_user)
     game = get_game_record(session.game_id, current_user, db)
 
-    check_game_timeout(session, game, db)
+    timed_out = check_game_timeout(session, game, db)
+
+    if timed_out or game.status == "completed":
+        schedule_game_review(background_tasks, db, game.id)
 
     return {
         **get_game_state(session),
@@ -529,7 +630,6 @@ def new_game(
     player_color = request.player_color.strip().lower()
     time_control = request.time_control.strip().lower()
 
-    # Validate inputs
     if opponent not in ("ai", "human"):
         raise HTTPException(400, "Opponent must be ai or human")
 
@@ -539,12 +639,14 @@ def new_game(
     if player_color not in ("white", "black"):
         raise HTTPException(400, "Player color must be white or black")
 
-    # Validate and parse time control
     valid_time_controls = ["1+0", "3+0", "5+0", "10+0", "15+0"]
+
     if time_control not in valid_time_controls:
-        raise HTTPException(400, f"Invalid time control. Must be one of: {', '.join(valid_time_controls)}")
-    
-    # Parse minutes from time control (all have 0 increment)
+        raise HTTPException(
+            400,
+            f"Invalid time control. Must be one of: {', '.join(valid_time_controls)}",
+        )
+
     minutes = int(time_control.split("+")[0])
     initial_time_ms = minutes * 60 * 1000
 
@@ -638,6 +740,7 @@ def set_difficulty(
 @app.post("/api/move")
 def player_move(
     request: MoveRequest,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -648,6 +751,7 @@ def player_move(
         raise HTTPException(400, "Game is already completed")
 
     if check_game_timeout(session, game, db):
+        schedule_game_review(background_tasks, db, game.id)
         return get_game_state(session)
 
     board = session.board
@@ -670,6 +774,15 @@ def player_move(
         captured_piece = get_captured_piece(board, move)
         san = move_to_san(board, move)
 
+        save_move_record(
+            db,
+            game,
+            board,
+            move,
+            san,
+            len(session.history) + 1,
+        )
+
         old_state = make_move(board, move)
 
         session.undo_stack.append((move, old_state))
@@ -680,6 +793,9 @@ def player_move(
         sync_session_to_game(session, game, db)
 
         complete_if_finished(session, db)
+
+        if game.status == "completed":
+            schedule_game_review(background_tasks, db, game.id)
 
         return {
             **get_game_state(session),
@@ -698,6 +814,7 @@ def player_move(
 
 @app.post("/api/ai-move")
 def ai_move(
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -708,6 +825,7 @@ def ai_move(
         raise HTTPException(400, "Game is already completed")
 
     if check_game_timeout(session, game, db):
+        schedule_game_review(background_tasks, db, game.id)
         return get_game_state(session)
 
     if session.opponent_type != "ai":
@@ -734,16 +852,29 @@ def ai_move(
 
         thinking_time = time.perf_counter() - start
 
-        # AI thinking time bhi uske clock se deduct hoga.
         if check_game_timeout(session, game, db):
+            schedule_game_review(background_tasks, db, game.id)
             return get_game_state(session)
 
         if move is None:
             complete_if_finished(session, db)
+
+            if game.status == "completed":
+                schedule_game_review(background_tasks, db, game.id)
+
             return get_game_state(session)
 
         captured_piece = get_captured_piece(board, move)
         san = move_to_san(board, move)
+
+        save_move_record(
+            db,
+            game,
+            board,
+            move,
+            san,
+            len(session.history) + 1,
+        )
 
         old_state = make_move(board, move)
 
@@ -765,6 +896,9 @@ def ai_move(
 
         complete_if_finished(session, db)
 
+        if game.status == "completed":
+            schedule_game_review(background_tasks, db, game.id)
+
         return {
             **get_game_state(session),
             "last_move": san,
@@ -776,6 +910,113 @@ def ai_move(
         raise
     except Exception as error:
         raise HTTPException(500, f"AI move failed: {error}")
+
+
+# =====================================================
+# GAME REVIEW API
+# =====================================================
+
+@app.get("/api/games/{game_id}/review")
+def get_game_review(
+    game_id: int,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    game = get_game_record(game_id, current_user, db)
+
+    review = db.query(GameReview).filter(
+        GameReview.game_id == game_id
+    ).first()
+
+    if game.status != "completed":
+        if review is None:
+            return {
+                "game_id": game_id,
+                "status": "pending",
+                "review": None,
+                "review_json": None,
+                "white_accuracy": None,
+                "black_accuracy": None,
+                "opening_name": None,
+                "error": None,
+            }
+
+    if review is None:
+        review = GameReview(
+            game_id=game_id,
+            status="pending",
+        )
+        db.add(review)
+        db.commit()
+        db.refresh(review)
+
+    if review.status in ("pending", "failed") and game.status == "completed":
+        if review.status == "failed":
+            review.status = "pending"
+            review.error = None
+            db.commit()
+
+        background_tasks.add_task(
+            generate_game_review,
+            game_id,
+        )
+
+    return get_review_response(review)
+
+
+@app.post("/api/games/{game_id}/review/retry")
+def retry_game_review(
+    game_id: int,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    game = get_game_record(game_id, current_user, db)
+
+    if game.status != "completed":
+        raise HTTPException(
+            status_code=400,
+            detail="Game is not completed yet",
+        )
+
+    review = db.query(GameReview).filter(
+        GameReview.game_id == game_id
+    ).first()
+
+    if review is None:
+        review = GameReview(
+            game_id=game_id,
+            status="pending",
+        )
+        db.add(review)
+    else:
+        if review.status == "analyzing":
+            raise HTTPException(
+                status_code=409,
+                detail="Review is already being generated",
+            )
+
+        review.status = "pending"
+        review.review_json = None
+        review.white_accuracy = None
+        review.black_accuracy = None
+        review.opening_name = None
+        review.error = None
+
+    db.commit()
+    db.refresh(review)
+
+    background_tasks.add_task(
+        generate_game_review,
+        game_id,
+    )
+
+    return {
+        "game_id": game_id,
+        "status": "pending",
+        "message": "Review generation started",
+    }
 
 
 # =====================================================
@@ -808,8 +1049,6 @@ def undo(
         if session.history:
             session.history.pop()
 
-    # Clock aur material score ko undo karne ke liye
-    # snapshots ki zarurat hai; is version mein board undo hota hai.
     session.last_ai_stats = {}
 
     return get_game_state(session)
